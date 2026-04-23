@@ -1,0 +1,72 @@
+# GitHub Actions: Agent-Collab Coordination Check
+# Validates agent coordination on every PR.
+# Copy to: .github/workflows/agent-collab.yml
+
+name: Agent-Collab Check
+
+on:
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  coordination:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check coordination
+        run: |
+          if [ ! -d ".agent-collab" ]; then
+            echo "No agent-collab setup — skipping"
+            exit 0
+          fi
+
+          echo "═══ Agent-Collab PR Check ═══"
+
+          CLAIMS=".agent-collab/claims.json"
+          MANIFEST=".agent-collab/manifest.json"
+
+          if [ ! -f "$CLAIMS" ] || [ ! -f "$MANIFEST" ]; then
+            echo "⚠ Missing coordination files"
+            exit 0
+          fi
+
+          # Get PR branch agent name
+          BRANCH="${{ github.head_ref }}"
+          AGENT=""
+          if [[ "$BRANCH" == agent/* ]]; then
+            AGENT=$(echo "$BRANCH" | cut -d'/' -f2)
+            echo "PR agent: $AGENT"
+          fi
+
+          # Check changed files against claims
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null || echo "")
+          WARNINGS=0
+
+          for file in $CHANGED; do
+            # Check direct + parent claims
+            DIR="$file"
+            while [ "$DIR" != "." ] && [ "$DIR" != "/" ]; do
+              OWNER=$(jq -r --arg d "$DIR" '.claims[$d].agent // empty' "$CLAIMS" 2>/dev/null)
+              if [ -n "$OWNER" ] && [ "$OWNER" != "$AGENT" ]; then
+                echo "⚠ $file claimed by $OWNER (PR agent: ${AGENT:-unknown})"
+                WARNINGS=$((WARNINGS + 1))
+                break
+              fi
+              DIR=$(dirname "$DIR")
+            done
+          done
+
+          if [ "$WARNINGS" -gt 0 ]; then
+            echo ""
+            echo "⛔ $WARNINGS file(s) have conflicting ownership"
+            echo "   Coordinate with the claiming agent before merging."
+            exit 1
+          fi
+
+          echo "✓ No ownership conflicts"
+
+          # Show readiness
+          TOTAL=$(jq '.agents | length' "$MANIFEST")
+          READY=$(jq '[.agents[] | select(.ready == true)] | length' "$MANIFEST")
+          echo "Readiness: $READY/$TOTAL agents ready"

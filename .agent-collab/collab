@@ -1,0 +1,732 @@
+#!/usr/bin/env python3
+"""
+collab — Multi-agent collaboration CLI for GitHub repos.
+
+Drop .agent-collab/ into any repo. Any AI agent that clones it
+can immediately start coordinating with other agents.
+
+Usage:
+    .agent-collab/collab <command> [options]
+
+Auto-discovers from: README.md, CLAUDE.md, .cursorrules, AGENTS.md, .github/copilot-instructions.md
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Paths ────────────────────────────────────────────────────────────
+
+# Resolve to the actual .agent-collab directory regardless of cwd
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = None  # detected on first use
+
+# Data files (inside .agent-collab/)
+MANIFEST = lambda: SCRIPT_DIR / "manifest.json"
+CLAIMS = lambda: SCRIPT_DIR / "claims.json"
+LOG_FILE = lambda: SCRIPT_DIR / "log.jsonl"
+CURRENT_AGENT = lambda: SCRIPT_DIR / ".current-agent"
+CONFIG = lambda: SCRIPT_DIR / "config.json"
+
+# ── Styling ──────────────────────────────────────────────────────────
+
+class C:
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    YELLOW = "\033[1;33m"
+    BLUE = "\033[0;34m"
+    CYAN = "\033[0;36m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    NC = "\033[0m"
+
+
+def die(msg):
+    print(f"{C.RED}✗ {msg}{C.NC}", file=sys.stderr)
+    sys.exit(1)
+
+
+def info(msg):
+    print(f"{C.BLUE}ℹ{C.NC} {msg}")
+
+
+def ok(msg):
+    print(f"{C.GREEN}✓{C.NC} {msg}")
+
+
+def warn(msg):
+    print(f"{C.YELLOW}⚠{C.NC} {msg}")
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def get_repo_root() -> Path:
+    global REPO_ROOT
+    if REPO_ROOT:
+        return REPO_ROOT
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, cwd=SCRIPT_DIR
+        )
+        if result.returncode == 0:
+            REPO_ROOT = Path(result.stdout.strip())
+            return REPO_ROOT
+    except Exception:
+        pass
+    REPO_ROOT = SCRIPT_DIR.parent
+    return REPO_ROOT
+
+
+def load_json(path: Path) -> dict:
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def save_json(path: Path, data: dict):
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_agent_id() -> str | None:
+    env = os.environ.get("COLLAB_AGENT_ID")
+    if env:
+        return env
+    cp = CURRENT_AGENT()
+    if cp.exists():
+        return cp.read_text().strip()
+    return None
+
+
+def require_agent() -> str:
+    agent = get_agent_id()
+    if not agent:
+        die("No agent registered. Run: .agent-collab/collab register --name <your-name>")
+    return agent
+
+
+def append_log(event: str, detail: str, agent: str = "unknown"):
+    ts = now_iso()
+    entry = {"ts": ts, "agent": agent, "event": event, "detail": detail}
+    with open(LOG_FILE(), "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def slugify(text: str) -> str:
+    slug = text.lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-")[:40]
+
+
+def rel_path(p: Path) -> str:
+    """Make a path relative to repo root for display."""
+    try:
+        return str(p.relative_to(get_repo_root()))
+    except ValueError:
+        return str(p)
+
+
+# ── Auto-discovery ───────────────────────────────────────────────────
+
+DISCOVERY_FILES = [
+    "README.md",
+    "CLAUDE.md",
+    ".cursorrules",
+    "AGENTS.md",
+    ".github/copilot-instructions.md",
+    "CONTRIBUTING.md",
+    "INSTRUCTIONS.md",
+]
+
+DISCOVERY_MARKER = "<!-- agent-collab:managed -->"
+
+DISCOVERY_BLOCK = """
+<!-- agent-collab:managed -->
+## 🤖 Multi-Agent Coordination
+
+This repository uses **agent-collab** for multi-agent collaboration.
+
+**If you are an AI agent working on this repo:**
+
+```bash
+# 1. See who's working on what
+.agent-collab/collab status
+
+# 2. Register yourself
+.agent-collab/collab register --name "your-agent-name" --task "what you're doing"
+
+# 3. Claim files before editing
+.agent-collab/collab claim src/your-area/ --reason "your task"
+
+# 4. Check if a path is safe to edit
+.agent-collab/collab check src/some/file.ts
+
+# 5. Release claims when done
+.agent-collab/collab release src/your-area/
+
+# 6. Signal completion
+.agent-collab/collab ready
+```
+
+**Rules:**
+- ⛔ Never edit files claimed by another agent
+- ✅ Always `collab claim` before editing
+- ✅ Always `collab release` when done with a section
+- ✅ Run `collab status` at the start of every session
+- ✅ Run `collab ready` when your task is complete
+
+Full docs: `.agent-collab/README.md`
+<!-- /agent-collab:managed -->
+"""
+
+
+def cmd_init(args):
+    """Initialize coordination and inject discovery hooks into repo files."""
+    repo = get_repo_root()
+    agent_dir = repo / ".agent-collab"
+
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    # Config
+    config = {
+        "version": "1.0.0",
+        "repo": repo.name,
+        "created": now_iso(),
+        "auto_discover": True,
+    }
+    save_json(CONFIG(), config)
+
+    # Manifest
+    save_json(MANIFEST(), {
+        "version": "1.0.0",
+        "repo": repo.name,
+        "created": now_iso(),
+        "agents": {},
+    })
+
+    # Claims
+    save_json(CLAIMS(), {"version": "1.0.0", "claims": {}})
+
+    # Inject discovery blocks into repo files
+    injected = 0
+    for filename in DISCOVERY_FILES:
+        filepath = repo / filename
+        if filepath.exists():
+            content = filepath.read_text()
+            if DISCOVERY_MARKER not in content:
+                # Append discovery block
+                content = content.rstrip() + "\n" + DISCOVERY_BLOCK + "\n"
+                filepath.write_text(content)
+                ok(f"Injected coordination hook into {filename}")
+                injected += 1
+            else:
+                info(f"{filename} already has coordination hook")
+        elif filename == "README.md":
+            # Create README.md with the hook
+            filepath.write_text(f"# {repo.name}\n{DISCOVERY_BLOCK}\n")
+            ok(f"Created {filename} with coordination hook")
+            injected += 1
+
+    # Create a symlink for convenience: repo-root/collab -> .agent-collab/collab
+    convenience = repo / "collab"
+    if not convenience.exists():
+        try:
+            convenience.symlink_to(".agent-collab/collab")
+            ok("Created ./collab convenience symlink")
+        except OSError:
+            # Symlink might fail on some systems, create a wrapper script instead
+            convenience.write_text(
+                '#!/usr/bin/env bash\nexec "$(dirname "$0")/.agent-collab/collab" "$@"\n'
+            )
+            os.chmod(convenience, 0o755)
+            ok("Created ./collab wrapper script")
+
+    # .gitignore for local agent state
+    gitignore = agent_dir / ".gitignore"
+    gitignore.write_text(".current-agent\n__pycache__/\n*.pyc\n")
+
+    ok(f"Initialized agent-collab in {repo.name}")
+    info(f"Tool location: .agent-collab/collab")
+    info(f"Discovery hooks injected into {injected} file(s)")
+    print()
+    info("Any agent cloning this repo will see the coordination instructions.")
+    info("Next: .agent-collab/collab register --name <agent-name> --task <description>")
+
+
+def cmd_register(args):
+    """Register an agent."""
+    manifest = load_json(MANIFEST())
+    if not manifest:
+        die("Not initialized. Run: .agent-collab/collab init")
+
+    if args.name in manifest.get("agents", {}):
+        die(f"Agent '{args.name}' already registered. Run: .agent-collab/collab unregister first.")
+
+    branch = args.branch
+    if not branch:
+        slug = slugify(args.task)
+        branch = f"agent/{args.name}/{slug}"
+
+    manifest.setdefault("agents", {})[args.name] = {
+        "task": args.task,
+        "type": args.type or "generic",
+        "branch": branch,
+        "status": "active",
+        "registered_at": now_iso(),
+        "last_seen": now_iso(),
+        "ready": False,
+    }
+    save_json(MANIFEST(), manifest)
+    CURRENT_AGENT().write_text(args.name)
+
+    append_log("register", f"Agent {args.name} registered: {args.task}", args.name)
+
+    ok(f"Registered: {C.BOLD}{args.name}{C.NC} [{args.type or 'generic'}]")
+    info(f"Task: {args.task}")
+    info(f"Branch: {branch}")
+    print()
+    info("Next:")
+    print(f"  git checkout -b {branch}")
+    print(f"  .agent-collab/collab claim <files> --reason \"...\"")
+    print(f"  ... work ...")
+    print(f"  .agent-collab/collab release <files> && .agent-collab/collab ready")
+
+
+def cmd_unregister(args):
+    """Unregister current agent and release all claims."""
+    agent = require_agent()
+    manifest = load_json(MANIFEST())
+    claims_data = load_json(CLAIMS())
+
+    manifest.get("agents", {}).pop(agent, None)
+    save_json(MANIFEST(), manifest)
+
+    claims_data["claims"] = {
+        k: v for k, v in claims_data.get("claims", {}).items()
+        if v.get("agent") != agent
+    }
+    save_json(CLAIMS(), claims_data)
+
+    cp = CURRENT_AGENT()
+    if cp.exists():
+        cp.unlink()
+
+    append_log("unregister", f"Agent {agent} unregistered", agent)
+    ok(f"Unregistered: {agent}")
+
+
+def cmd_claim(args):
+    """Claim files/directories for exclusive editing."""
+    agent = require_agent()
+    claims_data = load_json(CLAIMS())
+    claims = claims_data.setdefault("claims", {})
+    reason = args.reason or ""
+
+    for path in args.paths:
+        # Normalize path
+        path = path.rstrip("/")
+
+        existing = claims.get(path, {})
+        if existing and existing.get("agent") != agent:
+            warn(f"'{path}' is claimed by {existing['agent']}!")
+            warn("Consider coordinating before editing.")
+
+        # Check parent/child overlaps
+        for claimed_path, claimed_info in claims.items():
+            if claimed_info.get("agent") != agent:
+                if path.startswith(claimed_path + "/") or claimed_path.startswith(path + "/"):
+                    warn(f"Overlap: '{path}' ↔ '{claimed_path}' ({claimed_info['agent']})")
+
+        claims[path] = {
+            "agent": agent,
+            "claimed_at": now_iso(),
+            "reason": reason,
+        }
+        ok(f"Claimed: {C.BOLD}{path}{C.NC}")
+        append_log("claim", f"{agent} claimed {path}: {reason}", agent)
+
+    save_json(CLAIMS(), claims_data)
+
+
+def cmd_release(args):
+    """Release claims on files."""
+    agent = require_agent()
+    claims_data = load_json(CLAIMS())
+    claims = claims_data.get("claims", {})
+
+    if args.all:
+        claims_data["claims"] = {
+            k: v for k, v in claims.items() if v.get("agent") != agent
+        }
+        save_json(CLAIMS(), claims_data)
+        ok(f"Released all claims by {agent}")
+        append_log("release", f"{agent} released all claims", agent)
+        return
+
+    if not args.paths:
+        die("Usage: .agent-collab/collab release <path...> | --all")
+
+    for path in args.paths:
+        path = path.rstrip("/")
+        owner = claims.get(path, {}).get("agent", "")
+        if owner and owner != agent:
+            warn(f"'{path}' is claimed by {owner}, not you")
+        if path in claims:
+            del claims[path]
+            ok(f"Released: {C.BOLD}{path}{C.NC}")
+            append_log("release", f"{agent} released {path}", agent)
+
+    save_json(CLAIMS(), claims_data)
+
+
+def cmd_status(args):
+    """Show all agents, claims, and activity."""
+    manifest = load_json(MANIFEST())
+    claims_data = load_json(CLAIMS())
+
+    print(f"\n{C.BOLD}{'═' * 50}{C.NC}")
+    print(f"{C.BOLD}  🤖 Agent-Collab Status{C.NC}")
+    print(f"{C.BOLD}{'═' * 50}{C.NC}\n")
+
+    # Agents
+    agents = manifest.get("agents", {})
+    print(f"{C.BOLD}  Agents ({len(agents)}):{C.NC}")
+    if not agents:
+        print(f"    {C.DIM}None registered{C.NC}")
+    else:
+        for name, a in agents.items():
+            status_icon = "✅" if a.get("ready") else "🔄"
+            print(f"    {status_icon} {C.BOLD}{name}{C.NC} [{a.get('type', '?')}]")
+            print(f"       task: {a.get('task', '?')}")
+            print(f"       branch: {a.get('branch', '?')}")
+            print(f"       status: {a.get('status', '?')}")
+
+    # Claims
+    claims = claims_data.get("claims", {})
+    print(f"\n{C.BOLD}  Claims ({len(claims)}):{C.NC}")
+    if not claims:
+        print(f"    {C.DIM}None{C.NC}")
+    else:
+        for path, c in claims.items():
+            reason = c.get("reason", "") or ""
+            reason_str = f" — {reason}" if reason else ""
+            print(f"    📁 {path} → {C.BOLD}{c.get('agent', '?')}{C.NC}{reason_str}")
+
+    # Conflicts
+    print()
+    _show_conflicts(claims)
+
+    # Activity
+    print(f"\n{C.BOLD}  Recent Activity:{C.NC}")
+    lf = LOG_FILE()
+    if lf.exists():
+        lines = lf.read_text().strip().split("\n")
+        for line in lines[-8:]:
+            try:
+                e = json.loads(line)
+                print(f"    {C.DIM}[{e['ts'][:16]}]{C.NC} {e['agent']}: {e['event']} — {e['detail']}")
+            except (json.JSONDecodeError, KeyError):
+                pass
+    else:
+        print(f"    {C.DIM}No activity yet{C.NC}")
+
+    print(f"\n{C.BOLD}{'═' * 50}{C.NC}\n")
+
+
+def _show_conflicts(claims: dict):
+    paths = list(claims.keys())
+    conflicts = []
+    for i, a in enumerate(paths):
+        for b in paths[i+1:]:
+            aa = claims[a].get("agent", "")
+            ab = claims[b].get("agent", "")
+            if aa != ab:
+                if b.startswith(a + "/") or a.startswith(b + "/"):
+                    conflicts.append((a, aa, b, ab))
+    if conflicts:
+        print(f"  {C.RED}⚠ Conflicts:{C.NC}")
+        for a, aa, b, ab in conflicts:
+            print(f"    {a} ({aa}) ↔ {b} ({ab})")
+    else:
+        print(f"  {C.GREEN}✓ No conflicts{C.NC}")
+
+
+def cmd_check(args):
+    """Check if a path is claimed."""
+    claims_data = load_json(CLAIMS())
+    claims = claims_data.get("claims", {})
+    path = args.path.rstrip("/")
+    agent = get_agent_id()
+
+    # Direct claim
+    owner = claims.get(path, {}).get("agent", "")
+
+    # Parent claim
+    if not owner:
+        parts = Path(path).parts
+        for i in range(len(parts) - 1, 0, -1):
+            parent = str(Path(*parts[:i]))
+            parent_owner = claims.get(parent, {}).get("agent", "")
+            if parent_owner:
+                owner = f"{parent_owner} (via {parent}/)"
+                break
+
+    if owner:
+        if agent and owner.startswith(agent):
+            ok(f"Claimed by you")
+        else:
+            warn(f"Claimed by: {owner}")
+            return 1
+    else:
+        ok("Available — safe to edit")
+    return 0
+
+
+def cmd_conflicts(args):
+    """Find overlapping claims."""
+    claims_data = load_json(CLAIMS())
+    _show_conflicts(claims_data.get("claims", {}))
+
+
+def cmd_ready(args):
+    """Signal work is complete."""
+    agent = require_agent()
+    manifest = load_json(MANIFEST())
+
+    agents = manifest.get("agents", {})
+    if agent in agents:
+        agents[agent]["ready"] = True
+        agents[agent]["ready_at"] = now_iso()
+        agents[agent]["status"] = "ready"
+        save_json(MANIFEST(), manifest)
+
+    append_log("ready", f"{agent} marked as ready to merge", agent)
+    ok(f"{agent} is ready to merge")
+
+
+def cmd_integrate(args):
+    """Check integration readiness."""
+    manifest = load_json(MANIFEST())
+    claims_data = load_json(CLAIMS())
+
+    print(f"\n{C.BOLD}{'═' * 50}{C.NC}")
+    print(f"{C.BOLD}  🔀 Integration Readiness{C.NC}")
+    print(f"{C.BOLD}{'═' * 50}{C.NC}\n")
+
+    agents = manifest.get("agents", {})
+    total = len(agents)
+    ready_count = sum(1 for a in agents.values() if a.get("ready"))
+
+    print(f"  Agents: {ready_count}/{total} ready")
+
+    if ready_count == total and total > 0:
+        ok("All agents ready — safe to merge!")
+    elif total == 0:
+        warn("No agents registered")
+    else:
+        warn("Waiting on:")
+        for name, a in agents.items():
+            if not a.get("ready"):
+                print(f"    ⏳ {name}: {a.get('task', '?')}")
+
+    print()
+    _show_conflicts(claims_data.get("claims", {}))
+
+    if ready_count > 0:
+        print(f"\n  {C.BOLD}Merge commands:{C.NC}")
+        for name, a in agents.items():
+            if a.get("ready"):
+                print(f"    git merge {a.get('branch', '?')}")
+
+    # File ownership map
+    claims = claims_data.get("claims", {})
+    if claims:
+        by_agent = {}
+        for path, c in claims.items():
+            by_agent.setdefault(c.get("agent", "?"), []).append(path)
+        print(f"\n  {C.BOLD}File ownership:{C.NC}")
+        for agent, paths in by_agent.items():
+            print(f"    {agent}:")
+            for p in paths:
+                print(f"      └─ {p}")
+
+    print(f"\n{C.BOLD}{'═' * 50}{C.NC}\n")
+
+
+def cmd_log(args):
+    """Write to or read activity log."""
+    if not args.message:
+        lf = LOG_FILE()
+        if lf.exists():
+            print(lf.read_text())
+        return
+    agent = get_agent_id() or "unknown"
+    msg = " ".join(args.message)
+    append_log("note", msg, agent)
+    ok(f"Logged: {msg}")
+
+
+def cmd_hook_install(args):
+    """Install git hooks for automatic coordination checks."""
+    repo = get_repo_root()
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    # pre-commit: check for unclaimed file edits
+    pre_commit = hooks_dir / "pre-commit"
+    pre_commit.write_text(f'''#!/usr/bin/env bash
+# agent-collab: pre-commit hook
+# Warns if editing files not claimed by this agent
+
+AGENT_ID_FILE="{SCRIPT_DIR}/.current-agent"
+CLAIMS_FILE="{CLAIMS()}"
+
+if [ ! -f "$AGENT_ID_FILE" ]; then
+    echo "⚠ No agent registered (run: .agent-collab/collab register)"
+    exit 0
+fi
+
+AGENT=$(cat "$AGENT_ID_FILE")
+STAGED=$(git diff --cached --name-only)
+
+if command -v jq &>/dev/null && [ -f "$CLAIMS_FILE" ]; then
+    for file in $STAGED; do
+        OWNER=$(jq -r --arg f "$file" '.claims[$f].agent // empty' "$CLAIMS_FILE" 2>/dev/null)
+        if [ -n "$OWNER" ] && [ "$OWNER" != "$AGENT" ]; then
+            echo "⛔ $file is claimed by $OWNER (you are $AGENT)"
+            echo "   Coordinate with $OWNER or claim a different area."
+            exit 1
+        fi
+    done
+fi
+''')
+    os.chmod(pre_commit, 0o755)
+    ok("Installed pre-commit hook")
+
+
+def cmd_help(args):
+    print(f"""
+{C.BOLD}collab{C.NC} — Multi-agent collaboration for GitHub repos
+
+{C.BOLD}SETUP:{C.NC}
+  init                          Initialize in a repo (injects discovery hooks)
+  hook-install                  Install git pre-commit hook
+
+{C.BOLD}AGENT LIFECYCLE:{C.NC}
+  register --name N --task T    Register yourself
+  unregister                    Remove yourself
+  ready                         Signal your work is complete
+
+{C.BOLD}CLAIMS:{C.NC}
+  claim <paths...> [--reason]   Claim files for exclusive editing
+  release <paths...>            Release claims
+  release --all                 Release all your claims
+  check <path>                  Check if a path is available
+
+{C.BOLD}VISIBILITY:{C.NC}
+  status                        See all agents, claims, activity
+  conflicts                     Find overlapping claims
+  integrate                     Check merge readiness
+  log [message]                 Write/read activity log
+
+{C.BOLD}ENVIRONMENT:{C.NC}
+  COLLAB_AGENT_ID               Override agent identity
+
+{C.BOLD}EXAMPLE:{C.NC}
+  .agent-collab/collab init
+  .agent-collab/collab register --name "openclaw-auth" --task "refactor auth"
+  .agent-collab/collab claim src/auth/ --reason "OAuth2 work"
+  .agent-collab/collab status
+  .agent-collab/collab release src/auth/
+  .agent-collab/collab ready
+""")
+
+
+# ── Dispatch ─────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="collab",
+        description="Multi-agent collaboration for GitHub repos",
+        add_help=False,
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    sub.add_parser("init", help="Initialize coordination")
+    sub.add_parser("hook-install", help="Install git hooks")
+
+    # register
+    p = sub.add_parser("register", help="Register agent")
+    p.add_argument("--name", "-n", required=True)
+    p.add_argument("--task", "-t", required=True)
+    p.add_argument("--type", default="generic")
+    p.add_argument("--branch", "-b")
+
+    # unregister
+    sub.add_parser("unregister", help="Unregister agent")
+
+    # claim
+    p = sub.add_parser("claim", help="Claim files")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--reason", "-r", default="")
+
+    # release
+    p = sub.add_parser("release", help="Release claims")
+    p.add_argument("paths", nargs="*")
+    p.add_argument("--all", "-a", action="store_true")
+
+    # status
+    sub.add_parser("status", help="Show status")
+
+    # check
+    p = sub.add_parser("check", help="Check path")
+    p.add_argument("path")
+
+    # conflicts
+    sub.add_parser("conflicts", help="Find conflicts")
+
+    # ready
+    sub.add_parser("ready", help="Signal completion")
+
+    # integrate
+    sub.add_parser("integrate", help="Check merge readiness")
+
+    # log
+    p = sub.add_parser("log", help="Activity log")
+    p.add_argument("message", nargs="*")
+
+    # help
+    sub.add_parser("help", help="Show help")
+
+    args = parser.parse_args()
+
+    if not args.command or args.command == "help":
+        cmd_help(args)
+        return
+
+    cmds = {
+        "init": cmd_init, "hook-install": cmd_hook_install,
+        "register": cmd_register, "unregister": cmd_unregister,
+        "claim": cmd_claim, "release": cmd_release,
+        "status": cmd_status, "check": cmd_check, "conflicts": cmd_conflicts,
+        "ready": cmd_ready, "integrate": cmd_integrate, "log": cmd_log,
+    }
+
+    if args.command in cmds:
+        cmds[args.command](args)
+    else:
+        die(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
